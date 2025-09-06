@@ -1,30 +1,35 @@
 options:
   logging: CLOUD_LOGGING_ONLY
+
 substitutions:
   _SERVICE: calculate-materials
-  _REGION: us-east4
-  _REPO: roofing
+  _REGION:  us-east4
+  _REPO:    roofing
+  _BUILD_SA: cb-deployer@roofingcalculator.iam.gserviceaccount.com
   _RUNTIME_SA: roofing-ai-agent-service@roofingcalculator.iam.gserviceaccount.com
 
 steps:
-# Build
-- name: gcr.io/cloud-builders/docker
-  args: ['build','-t','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID','.']
-  dir: calculate_materials
+  # Build image from calculate_materials/
+  - name: gcr.io/cloud-builders/docker
+    dir: calculate_materials
+    args: ['build','-t','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID','.']
 
-# Push
-- name: gcr.io/cloud-builders/docker
-  args: ['push','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID']
+  # Push to Artifact Registry
+  - name: gcr.io/cloud-builders/docker
+    args: ['push','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID']
 
-# Deploy to Cloud Run (public)
-- name: gcr.io/google.com/cloudsdktool/cloud-sdk
-  entrypoint: gcloud
-  args:
-    ['run','deploy','${_SERVICE}',
-     '--image','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID',
-     '--region','${_REGION}','--platform','managed','--allow-unauthenticated',
-     '--service-account','${_RUNTIME_SA}',
-     '--port','8080']
+  # Deploy to Cloud Run (impersonate deploy SA; set runtime SA)
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      ['run','deploy','${_SERVICE}',
+       '--image','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID',
+       '--region','${_REGION}',
+       '--platform','managed',
+       '--allow-unauthenticated',
+       '--port','8080',
+       '--service-account','${_RUNTIME_SA}',
+       '--impersonate-service-account','${_BUILD_SA}']
 
 images:
-- '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID'
