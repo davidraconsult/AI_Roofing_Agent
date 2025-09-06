@@ -6,22 +6,22 @@ substitutions:
   _REPO: roofing
 
 steps:
-# Build the image from the calculate_materials folder
+# Build from calculate_materials folder
 - name: gcr.io/cloud-builders/docker
-  args: ['build','-t','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA','.']
+  args: ['build','-t','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID','.']
   dir: calculate_materials
 
-# Push the image to Artifact Registry
+# Push to Artifact Registry
 - name: gcr.io/cloud-builders/docker
-  args: ['push','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA']
+  args: ['push','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID']
 
 # Deploy to Cloud Run (public)
 - name: gcr.io/google.com/cloudsdktool/cloud-sdk
   entrypoint: gcloud
   args:
     ['run','deploy','${_SERVICE}',
-     '--image','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA',
+     '--image','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID',
      '--region','${_REGION}','--platform','managed','--allow-unauthenticated','--port','8080']
 
 images:
-- '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
+- '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID'
