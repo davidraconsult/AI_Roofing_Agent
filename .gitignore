@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+.env
+*.pyc
+node_modules/
+roofing-ai-agent-sa.json

@@ -1,0 +1,312 @@
+# save_bom backend (FastAPI)
+# - Reads CONFIG_JSON (Secret Manager) + ENV_NAME to resolve IDs
+# - Appends to master "Generated BOMs"
+# - Creates per-job Drive folder (YYYY/MM/<job_slug>)
+# - Copies Job Sheet Template into that folder and writes all tabs
+
+from fastapi import FastAPI, Request
+from typing import Any, Dict, List
+import os, json
+from datetime import datetime
+
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+
+app = FastAPI()
+
+# -------------------------
+# Config / Secrets
+# -------------------------
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+ENV_NAME = os.getenv("ENV_NAME", "dev")  # dev | staging | prod
+
+CONFIG_JSON = os.getenv("CONFIG_JSON")   # injected from Secret Manager
+if CONFIG_JSON:
+    _cfg = json.loads(CONFIG_JSON)
+    _env = _cfg["envs"][ENV_NAME]
+    SHEET_ID        = _env["sheet_id"]                 # Master log ("Generated BOMs — <env>")
+    JOBS_FOLDER_ID  = _env["jobs_folder_id"]           # Jobs/<env> root folder
+    JOB_TEMPLATE_ID = _cfg["job_template_id"]          # Job Sheet template file id
+    SHARED_DRIVE_ID = _cfg.get("shared_drive_id")      # optional, not strictly needed
+else:
+    # Fallback to individual env vars for backward compatibility
+    SHEET_ID        = os.environ.get("SHEET_ID")
+    JOBS_FOLDER_ID  = os.environ.get("JOBS_FOLDER_ID")
+    JOB_TEMPLATE_ID = os.environ.get("JOB_TEMPLATE_ID")
+    SHARED_DRIVE_ID = os.environ.get("SHARED_DRIVE_ID")
+
+SERVICE_ACCOUNT_KEY = os.environ.get("SERVICE_ACCOUNT_KEY")  # JSON string (Secret)
+
+# -------------------------
+# Auth helpers
+# -------------------------
+def _creds():
+    if not SERVICE_ACCOUNT_KEY:
+        raise RuntimeError("SERVICE_ACCOUNT_KEY env var is missing")
+    key_dict = json.loads(SERVICE_ACCOUNT_KEY)
+    return Credentials.from_service_account_info(key_dict, scopes=SCOPES)
+
+def _gs():
+    return gspread.authorize(_creds())
+
+def _drive():
+    # Shared-Drive safe when used with supportsAllDrives=True in calls
+    return build("drive", "v3", credentials=_creds())
+
+# -------------------------
+# Drive helpers (Shared Drive safe)
+# -------------------------
+FOLDER_MIME = "application/vnd.google-apps.folder"
+
+def _get_file(drive, file_id: str, fields: str = "id,name,parents,mimeType"):
+    return drive.files().get(
+        fileId=file_id,
+        fields=fields,
+        supportsAllDrives=True
+    ).execute()
+
+def _ensure_folder(drive, name: str, parent_id: str) -> str:
+    """Return existing folder id with name under parent_id; create if missing."""
+    q = (
+        f"name='{name}' and mimeType='{FOLDER_MIME}' "
+        f"and '{parent_id}' in parents and trashed=false"
+    )
+    res = drive.files().list(
+        q=q,
+        spaces="drive",
+        fields="files(id,name,parents)",
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+        pageSize=1,
+    ).execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
+
+    meta = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
+    created = drive.files().create(
+        body=meta,
+        fields="id",
+        supportsAllDrives=True
+    ).execute()
+    return created["id"]
+
+def _copy_to_folder(drive, src_file_id: str, name: str, parent_id: str) -> str:
+    """Copy a file into a destination folder; return new file id."""
+    body = {"name": name, "parents": [parent_id]}
+    copied = drive.files().copy(
+        fileId=src_file_id,
+        body=body,
+        fields="id",
+        supportsAllDrives=True
+    ).execute()
+    return copied["id"]
+
+# -------------------------
+# Sheets helpers
+# -------------------------
+def _header_map(ws) -> Dict[str, int]:
+    """Return header->column index (1-based)."""
+    headers = ws.row_values(1)
+    return {h.strip(): idx + 1 for idx, h in enumerate(headers) if h and h.strip()}
+
+def _al(col: int) -> str:
+    """1-based column number to A1 letters (no gspread.utils dependency)."""
+    s = ""
+    n = col
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+def _upsert_row_by_header(ws, data: Dict[str, Any], row: int = 2):
+    cols = _header_map(ws)
+    # ensure row exists
+    if ws.row_count < row:
+        ws.add_rows(row - ws.row_count)
+
+    updates = []
+    for key, val in data.items():
+        if key in cols:
+            updates.append({
+                "range": f"{ws.title}!{_al(cols[key])}{row}",
+                "values": [[val]],
+            })
+    if updates:
+        ws.spreadsheet.values_batch_update({
+            "data": updates,
+            "valueInputOption": "USER_ENTERED"
+        })
+
+def _append_rows_by_header(ws, rows: List[Dict[str, Any]]):
+    if not rows:
+        return
+    cols = _header_map(ws)
+    width = max(cols.values()) if cols else 1
+
+    # append row-by-row to keep it simple for sparse dicts
+    for r in rows:
+        line = [""] * width
+        for k, v in r.items():
+            if k in cols:
+                line[cols[k] - 1] = v
+        ws.append_row(line, value_input_option="USER_ENTERED")
+
+# -------------------------
+# Core ops
+# -------------------------
+def _append_to_master(sh, payload: Dict[str, Any]):
+    try:
+        ws = sh.worksheet("Generated BOMs")
+    except Exception:
+        ws = sh.add_worksheet(title="Generated BOMs", rows=1000, cols=15)
+        ws.update("A1:O1", [[
+            "timestamp", "job_address", "zip_code", "system_id", "shingle_color",
+            "waste_pct_final", "distributor_type", "report_url", "items_json"
+        ]])
+
+    ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    row = [
+        ts,
+        payload.get("job_address", ""),
+        payload.get("zip_code", ""),
+        (payload.get("selections") or {}).get("system_id", {}).get("value", ""),
+        (payload.get("selections") or {}).get("shingle_color", {}).get("value", ""),
+        payload.get("waste_pct_final", ""),
+        payload.get("distributor_type", ""),
+        payload.get("report_url", ""),
+        json.dumps(payload.get("bom_items") or payload.get("calculated_bom") or []),
+    ]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+def _normalize(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Make sure keys we expect exist; normalize simple types."""
+    return {
+        "selections":      body.get("selections") or {},
+        "report_url":      body.get("report_url", ""),
+        "waste_pct_final": body.get("waste_pct_final", ""),
+        "distributor_type":body.get("distributor_type", ""),
+        "linears":         body.get("linears") or {},
+        "openings":        body.get("openings") or {},
+        "ventilation_raw": body.get("ventilation_raw") or [],
+        "bom_items":       body.get("bom_items") or [],
+        "calculated_bom":  body.get("calculated_bom") or [],
+        "qc":              body.get("qc") or {},
+        "archive_json_gcs": body.get("archive_json_gcs", ""),
+        "archive_bom_csv_gcs": body.get("archive_bom_csv_gcs", ""),
+        "job_address":     body.get("job_address", ""),
+        "zip_code":        str(body.get("zip_code", "")).strip(),
+        "geometry":        body.get("geometry") or {},
+    }
+
+def _create_job_artifacts(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Create env/year/month/job folder, copy template, fill tabs."""
+    drive = _drive()
+
+    # sanity: ensure Jobs root exists / is shared to the service account
+    _get_file(drive, JOBS_FOLDER_ID)
+
+    # Build job slug
+    addr = (payload.get("job_address") or "").strip()
+    zipc = str(payload.get("zip_code") or "").strip()
+    now = datetime.utcnow()
+    base = now.strftime("%Y%m%d") + (f"-{zipc}" if zipc else "")
+    job_slug = (addr or base).replace(" ", "_")
+
+    # /<JOBS_FOLDER_ID>/<YYYY>/<MM>/<job_slug>
+    year_id  = _ensure_folder(drive, now.strftime("%Y"), JOBS_FOLDER_ID)
+    month_id = _ensure_folder(drive, now.strftime("%m"), year_id)
+    job_folder_id = _ensure_folder(drive, job_slug, month_id)
+
+    # Copy template into job folder
+    title = f"[{job_slug}] - Job Sheet"
+    sheet_file_id = _copy_to_folder(drive, JOB_TEMPLATE_ID, title, job_folder_id)
+
+    # Open the copied sheet
+    gs = _gs()
+    sh = gs.open_by_key(sheet_file_id)
+    job_id = job_slug
+
+    # Summary
+    summary = {
+        "job_id": job_id,
+        "created_at": now.isoformat(timespec="seconds") + "Z",
+        "job_address": payload.get("job_address", ""),
+        "zip_code": zipc,
+        "system_id": (payload.get("selections") or {}).get("system_id", {}).get("value", ""),
+        "shingle_color": (payload.get("selections") or {}).get("shingle_color", {}).get("value", ""),
+        "waste_pct_final": payload.get("waste_pct_final", ""),
+        "distributor_type": payload.get("distributor_type", ""),
+        "report_url": payload.get("report_url", ""),
+        "archive_json_gcs": payload.get("archive_json_gcs", ""),
+        "archive_bom_csv_gcs": payload.get("archive_bom_csv_gcs", ""),
+    }
+    _upsert_row_by_header(sh.worksheet("Summary"), summary, row=2)
+
+    # Geometry / Linears / Openings
+    _upsert_row_by_header(sh.worksheet("Geometry"), payload.get("geometry") or {}, row=2)
+    _upsert_row_by_header(sh.worksheet("Linears"),  payload.get("linears")  or {}, row=2)
+    _upsert_row_by_header(sh.worksheet("Openings"), payload.get("openings") or {}, row=2)
+
+    # VentilationRaw & BOM line items
+    _append_rows_by_header(sh.worksheet("VentilationRaw"), payload.get("ventilation_raw") or [])
+    _append_rows_by_header(
+        sh.worksheet("BOM"),
+        payload.get("bom_items") or payload.get("calculated_bom") or []
+    )
+
+    # Warnings/QC
+    _upsert_row_by_header(sh.worksheet("Warnings"), payload.get("qc") or {}, row=2)
+
+    return {
+        "job_id": job_id,
+        "sheet_id": sheet_file_id,
+        "sheet_url": f"https://docs.google.com/spreadsheets/d/{sheet_file_id}/edit",
+        "folder_url": f"https://drive.google.com/drive/folders/{job_folder_id}",
+    }
+
+# -------------------------
+# Endpoints
+# -------------------------
+@app.get("/healthz")
+def healthz():
+    return {
+        "ok": True,
+        "env": ENV_NAME,
+        "has_config_json": bool(CONFIG_JSON),
+        "sheet_id": SHEET_ID,
+        "jobs_folder_id": JOBS_FOLDER_ID,
+        "job_template_id": JOB_TEMPLATE_ID,
+    }
+
+@app.post("/")
+async def save_bom(req: Request):
+    body = await req.json()
+    payload = _normalize(body)
+
+    # 1) Append to master
+    master_err = ""
+    try:
+        gs = _gs()
+        master = gs.open_by_key(SHEET_ID)
+        _append_to_master(master, payload)
+    except Exception as e:
+        master_err = str(e)
+
+    # 2) Create job artifacts
+    try:
+        job = _create_job_artifacts(payload)
+    except Exception as e:
+        if master_err:
+            return {"ok": False, "error": f"Master append failed: {master_err}; Job create failed: {e}"}
+        return {"ok": True, "saved": 1, "warning": f"Created master row but not job artifacts: {e}"}
+
+    if master_err:
+        return {"ok": True, "saved": 1, "job": job, "warning": f"Master append failed: {master_err}"}
+
+    return {"ok": True, "saved": 1, "job": job}
