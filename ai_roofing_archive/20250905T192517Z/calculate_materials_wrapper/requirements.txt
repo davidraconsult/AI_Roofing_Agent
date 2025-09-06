@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-httpx
-google-auth
-google-cloud-storage
-
-requests
