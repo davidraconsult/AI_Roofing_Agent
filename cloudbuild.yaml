@@ -4,14 +4,15 @@ substitutions:
   _SERVICE: calculate-materials
   _REGION: us-east4
   _REPO: roofing
+  _RUNTIME_SA: roofing-ai-agent-service@roofingcalculator.iam.gserviceaccount.com
 
 steps:
-# Build from calculate_materials folder
+# Build
 - name: gcr.io/cloud-builders/docker
   args: ['build','-t','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID','.']
   dir: calculate_materials
 
-# Push to Artifact Registry
+# Push
 - name: gcr.io/cloud-builders/docker
   args: ['push','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID']
 
@@ -21,7 +22,9 @@ steps:
   args:
     ['run','deploy','${_SERVICE}',
      '--image','${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID',
-     '--region','${_REGION}','--platform','managed','--allow-unauthenticated','--port','8080']
+     '--region','${_REGION}','--platform','managed','--allow-unauthenticated',
+     '--service-account','${_RUNTIME_SA}',
+     '--port','8080']
 
 images:
 - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID'
