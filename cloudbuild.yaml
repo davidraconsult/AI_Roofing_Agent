@@ -1,19 +1,30 @@
 options:
   logging: CLOUD_LOGGING_ONLY
 substitutions:
-  _SERVICE: calculate-materials
-  _REGION: us-east4
-  _REPO: roofing
+  _SERVICE: "calculate-materials"
+  _REGION:  "us-east4"
+  _REPO:    "roofing"
+
 steps:
+# Build the image from the calculate_materials folder
 - name: gcr.io/cloud-builders/docker
-  args: ['build','-t','-docker.pkg.dev/\roofingcalculator//:\','.']
+  args: ['build','-t','-docker.pkg.dev/roofingcalculator//:','.']
   dir: calculate_materials
+
+# Push the image to Artifact Registry
 - name: gcr.io/cloud-builders/docker
-  args: ['push','-docker.pkg.dev/\roofingcalculator//:\']
+  args: ['push','-docker.pkg.dev/roofingcalculator//:']
+
+# Deploy to Cloud Run (public)
 - name: gcr.io/google.com/cloudsdktool/cloud-sdk
   entrypoint: gcloud
-  args: ['run','deploy','',
-         '--image','-docker.pkg.dev/\roofingcalculator//:\',
-         '--region','','--allow-unauthenticated','--platform','managed','--port','8080']
+  args:
+    ['run','deploy','',
+     '--image','-docker.pkg.dev/roofingcalculator//:',
+     '--region','',
+     '--platform','managed',
+     '--allow-unauthenticated',
+     '--port','8080']
+
 images:
-- '-docker.pkg.dev/\roofingcalculator//:\'
+- '-docker.pkg.dev/roofingcalculator//:'
