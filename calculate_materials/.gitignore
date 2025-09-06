@@ -4,9 +4,3 @@ __pycache__/
 *.pyc
 node_modules/
 roofing-ai-agent-sa.json
-ai_roofing_archive/
-*.tar.gz
-*.swp
-ai_roofing_archive/
-*.tar.gz
-*.swp
